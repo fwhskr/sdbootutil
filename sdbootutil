@@ -4164,7 +4164,9 @@ pcrlock_sdboot()
 	# Join the cmdline and the initrd in a single component
 	shift_component 710-kernel-cmdline-initrd-entry
 	shift_component 710-kernel-cmdline-boot-loader
-	n=0
+	# Retained current-boot variations share the four-tuple PCR 9 budget.
+	local -a shifted_variations=(/var/lib/pcrlock.d/710-kernel-cmdline-initrd-entry.pcrlock.d/shift-*.pcrlock)
+	n=${#shifted_variations[@]}
 	while read -r cmdline; do
 		read -r initrd
 		[ -f "${boot_root}$initrd" ] || {
