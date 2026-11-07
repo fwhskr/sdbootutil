@@ -1,0 +1,559 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright 2026 SUSE LLC
+#
+# PCR9 budget regression for pcrlock_sdboot: the retained shifted
+# 710-kernel-cmdline-initrd-entry tuple counts against the 4-tuple
+# budget, together with the generated and the installer tuples.
+#
+# A fifth tuple predicts 2*5 = 10 PCR 9 values, past the 8-value
+# PolicyOR limit, and get_final_pcrs drops PCR 9 from the policy
+# (bsc#1274948).
+#
+# This runs the real pcrlock_sdboot from the library half of sdbootutil
+# (everything above the 'main' marker) in a bwrap sandbox with a fake
+# `pcrlock` peripheral, and asserts on the emitted component content:
+# the tuple count, the byte-identical retained current, and which
+# entries are covered.  No root, no TPM, no ESP, no live mutations.
+#
+# Usage:
+#   tests/pcrlock-budget [--script PATH] [CASE...]
+#
+# --script selects the sdbootutil under test (default: the working
+# tree), so the same run goes red on the baseline and green on the
+# fix.  A CASE argument runs only the named cases.
+#
+# Cases: shift-keeps-budget no-shift-stable installer-shared-budget
+#        fewer-inputs at-limit-keeps-current
+
+set -euo pipefail
+shopt -s nullglob
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+top="$(dirname "$here")"
+
+script="$top/sdbootutil"
+only=()
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--script) script="${2:?--script needs a path}"; shift 2 ;;
+		-h|--help)
+			sed -ne '/^# Usage:/,/^#$/ {s/^# \?//;p}' "$0"
+			exit 0 ;;
+		-*) echo "Unknown option $1" >&2; exit 2 ;;
+		*) only+=("$1"); shift ;;
+	esac
+done
+all_cases=(shift-keeps-budget no-shift-stable installer-shared-budget fewer-inputs at-limit-keeps-current)
+for want in "${only[@]}"; do
+	hit=
+	for known in "${all_cases[@]}"; do
+		[ "$want" = "$known" ] && hit=1
+	done
+	[ -n "$hit" ] || { echo "Unknown case $want" >&2; exit 2; }
+done
+
+[ -f "$script" ] || { echo "ERROR: no such sdbootutil: $script" >&2; exit 2; }
+grep -q '^####### main #######$' "$script" || \
+	{ echo "ERROR: no main marker in $script, nothing to source" >&2; exit 2; }
+for cmd in bwrap jq sha256sum timeout; do
+	command -v "$cmd" > /dev/null || { echo "SKIP: $cmd is not installed" >&2; exit 77; }
+done
+
+COMP=710-kernel-cmdline-initrd-entry
+
+scratch="$(mktemp -d /tmp/opencode/pcrlock-budget.XXXXXX)"
+trap 'rm -rf "$scratch"' EXIT
+
+sed '/^####### main #######$/,$d' "$script" > "$scratch/lib.sh"
+( set +u; . "$scratch/lib.sh"; true ) || { echo "ERROR: the library half does not source" >&2; exit 2; }
+
+# Fake systemd-pcrlock peripheral: this sandbox overlays the real host
+# binaries (there is no PATH lookup; pcrlock() calls an absolute path),
+# so the files the harness writes must be the deterministic fake ones,
+# emitting one record with the sha256 of its input.
+write_fake_pcrlock()
+{
+	FP_PATH="$1"
+	cat > "$FP_PATH" <<-'EOF'
+		#!/bin/bash
+		if [ "$1" = log ]; then
+			cat "$EVENTLOG_JSON"
+			exit 0
+		fi
+		out=""
+		in=""
+		for arg in "$@"; do
+			case "$arg" in
+				--pcrlock=*) out="${arg#--pcrlock=}" ;;
+				--pcr=*) ;;
+				lock-*) ;;
+				*) in="$arg" ;;
+			esac
+		done
+		[ -n "$out" ] && [ -n "$in" ] || { echo "fake pcrlock: unexpected call: $*" >&2; exit 1; }
+		d="$(sha256sum < "$in" | cut -d' ' -f1)"
+		printf '{"records": [{"pcr": 9, "digests": [{"hashAlg": "sha256", "digest": "%s"}]}]}\n' "$d" > "$out"
+	EOF
+	chmod +x "$FP_PATH"
+}
+
+# Runs inside the sandbox: sources the real library, points it at the
+# case directory, and calls the real pcrlock_sdboot
+cat > "$scratch/harness.sh" <<-'EOF'
+	#!/bin/bash
+	set -e
+	set +u
+	. "$LIB_SH"
+	set +e
+	trap - EXIT
+	rm -rf "$tmpdir"
+	tmpdir="$(mktemp -d -p "$WORK" -t sdbootutil.XXXXXX)"
+	# Mirror backup_initial_components: the installer tree the harness
+	# stages under $WORK/seed lands at the root of tmpdir
+	if [ -d "$WORK/seed" ]; then
+		cp -a "$WORK/seed/." "$tmpdir/"
+	fi
+	entryfile="$WORK/entries.json"
+	initialentryfile="$WORK/initial.json"
+	boot_root="$WORK/boot"
+	esp_root="$WORK/esp"
+	verbose=1
+	export SDB_ADD_INITIAL_COMPONENT="${SDB_ADD_INITIAL_COMPONENT:-}"
+	pcrlock_sdboot >"$WORK/stdout.log" 2>"$WORK/stderr.log"
+	echo "$?" > "$WORK/rc"
+EOF
+chmod +x "$scratch/harness.sh"
+
+# Case assertions and helpers.
+
+total_cases=0
+failed_cases=0
+
+# Global per-case state: sh does not allow `local` outside a function,
+# and the library half that is sourced above defines helpers with the
+# same plain names these would otherwise collide with
+WORK=
+PD=
+T_COMP_DIR=
+expect_shift=0
+expect_msg=none
+# shellcheck disable=SC2034 # written by note_expected/note_absent, read by check_component
+expected_covered=()
+# shellcheck disable=SC2034
+expected_absent=()
+FT_IDX= FT_JOINED= FT_INITRD0= FT_CMD= FT_INIT=
+IT_IDX= IT_JOINED= IT_INITRD0= IT_CMD= IT_INIT=
+SC_IDX= SC_PAIR= SC_CMD= SC_INIT=
+RH_RC=
+CC_RC= CC_F= CC_ENTRY= CC_NAME= CC_CMD= CC_INIT= CC_HIT=
+CC_FILES=() CC_GEN=() CC_SHIFTS=()
+C_PAIR= C_ABSENT= C_I=
+FP_PATH=
+RH_HAVE_USRBIN=
+RH_EXTRA_BIND=()
+
+fail()
+{
+	echo "     $*"
+	return 1
+}
+
+pairs_of()
+{
+	jq -r '[.records[].digests[] | select(.hashAlg=="sha256") | .digest] | join(" ")' "$1"
+}
+
+setup_case()
+{
+	rm -rf "$scratch/cases/$1"
+	WORK="$scratch/cases/$1"
+	PD="$WORK/pcrlock.d"
+	T_COMP_DIR="$PD/$COMP.pcrlock.d"
+	mkdir -p "$WORK/boot/boot" "$WORK/run" "$WORK/esp" "$T_COMP_DIR" \
+		"$PD/650-kernel-efi-application.pcrlock.d" \
+		"$PD/710-kernel-cmdline-boot-loader.pcrlock.d" \
+		"$PD/641-sdboot-loader-conf.pcrlock.d"
+	echo '{"log":[]}' > "$WORK/eventlog.json"
+	expect_shift=0
+	expect_msg=none
+}
+
+write_boot_file()
+{
+	echo -n "$2" > "$WORK/boot$1"
+}
+
+# The expected covered/absent lists: lines of "name cmd-digest init-digest".
+# Written by note_expected/note_absent, kept whole per case
+note_expected()
+{
+	expected_covered+=("$1 $2 $3")
+}
+
+note_absent()
+{
+	expected_absent+=("$1 $2")
+}
+
+# joined cmdline, digests and initrd path of future entry $1 (index)
+future_tuple()
+{
+	FT_IDX="$1"
+	FT_JOINED="$(jq -r --argjson i "$FT_IDX" '.[$i] | ((.initrd[0] | sub("/"; "\\"; "g")) + " " + .options)' "$WORK/entries.json")"
+	FT_INITRD0="$(jq -r --argjson i "$FT_IDX" '.[$i] | .initrd[0]' "$WORK/entries.json")"
+	FT_CMD="$(printf '%s' "initrd=$FT_JOINED" | sha256sum | cut -d' ' -f1)"
+	FT_INIT="$(sha256sum < "$WORK/boot$FT_INITRD0" | cut -d' ' -f1)"
+	echo "$FT_CMD $FT_INIT"
+}
+
+# Same for installer entry $1 of initial.json, whose initrds live under $tmpdir
+initial_tuple()
+{
+	IT_IDX="$1"
+	IT_JOINED="$(jq -r --argjson i "$IT_IDX" '.[$i] | ((.initrd[0] | sub("/"; "\\"; "g")) + " " + .options)' "$WORK/initial.json")"
+	IT_INITRD0="$(jq -r --argjson i "$IT_IDX" '.[$i] | .initrd[0]' "$WORK/initial.json")"
+	IT_CMD="$(printf '%s' "initrd=$IT_JOINED" | sha256sum | cut -d' ' -f1)"
+	IT_INIT="$(sha256sum < "$WORK/run$IT_INITRD0" | cut -d' ' -f1)"
+	echo "$IT_CMD $IT_INIT"
+}
+
+# Seed the component with the current tuple of future entry $1, so the
+# shift retains it, and keep a copy to prove it is never rewritten
+seed_current()
+{
+	SC_IDX="$1"
+	SC_PAIR="$(future_tuple "$SC_IDX")"
+	SC_CMD="${SC_PAIR%% *}"; SC_INIT="${SC_PAIR##* }"
+	jq -n --arg c "$SC_CMD" --arg i "$SC_INIT" \
+		'{"records": [{"pcr": 9, "digests": [{"hashAlg": "sha256", "digest": $c}]}, {"pcr": 9, "digests": [{"hashAlg": "sha256", "digest": $i}]}]}' \
+		> "$T_COMP_DIR/cmdline-initrd-9.pcrlock"
+	cp "$T_COMP_DIR/cmdline-initrd-9.pcrlock" "$WORK/seed-copy.pcrlock"
+	jq -n --arg c "$SC_CMD" --arg i "$SC_INIT" \
+		'{"log": [{"sha256": $c}, {"sha256": $i}, {"sha256": "decoy-not-in-any-variation"}]}' \
+		> "$WORK/eventlog.json"
+	expect_shift=1
+}
+
+run_harness()
+{
+	(
+	set +e
+	write_fake_pcrlock "$WORK/pcrlock-over-usrlib"
+	if [ -e /usr/bin/systemd-pcrlock ]; then
+		write_fake_pcrlock "$WORK/pcrlock-over-usrbin"
+		RH_HAVE_USRBIN=1
+	else
+		RH_HAVE_USRBIN=
+	fi
+	RH_EXTRA_BIND=()
+	if [ -n "$RH_HAVE_USRBIN" ]; then
+		RH_EXTRA_BIND+=(--bind "$WORK/pcrlock-over-usrbin" /usr/bin/systemd-pcrlock)
+	fi
+	SDB_ADD_INITIAL_COMPONENT="$1" \
+	LIB_SH="$scratch/lib.sh" WORK="$WORK" EVENTLOG_JSON="$WORK/eventlog.json" \
+		timeout -s KILL 30 bwrap \
+			--ro-bind / / \
+			--proc /proc --dev /dev --tmpfs /tmp \
+			--tmpfs /var --dir /var/lib \
+			--ro-bind "$scratch" "$scratch" \
+			--bind "$WORK" "$WORK" \
+			--bind "$PD" /var/lib/pcrlock.d \
+			--bind "$WORK/pcrlock-over-usrlib" /usr/lib/systemd/systemd-pcrlock ${RH_EXTRA_BIND[@]+"${RH_EXTRA_BIND[@]}"} \
+			--setenv PATH "/usr/bin:/bin" \
+			--setenv TMPDIR "$WORK" \
+			--die-with-parent \
+			/bin/bash "$scratch/harness.sh" 2>"$WORK/bwrap.err"
+	)
+	RH_RC=$?
+	if [ "$RH_RC" != 0 ]; then
+		echo "     bwrap exited $RH_RC: $(cat "$WORK/bwrap.err" 2>/dev/null)"
+		return 1
+	fi
+}
+
+# expect_shift and expect_msg ("loop", "initial", "none") are set by the case
+check_component()
+{
+	CC_RC=
+	CC_FILES=()
+	CC_GEN=()
+	CC_SHIFTS=()
+	[ -f "$WORK/rc" ] || { fail "the harness produced no result"; return 1; }
+	CC_RC="$(cat "$WORK/rc")"
+	[ "$CC_RC" = 0 ] || fail "pcrlock_sdboot exited $CC_RC" || return 1
+
+	CC_FILES=("$T_COMP_DIR"/*.pcrlock)
+	[ "${#CC_FILES[@]}" -le 4 ] || {
+		fail "budget exceeded: ${#CC_FILES[@]} tuples in $COMP (2x${#CC_FILES[@]}=$((2 * ${#CC_FILES[@]})) PCR9 alternatives, the PolicyOR limit is 8)"
+		return 1
+	}
+
+	for CC_F in ${CC_FILES[@]+"${CC_FILES[@]}"}; do
+		case "$(basename "$CC_F")" in
+			shift-*) CC_SHIFTS+=("$CC_F") ;;
+			*) CC_GEN+=("$CC_F") ;;
+		esac
+	done
+	if [ "$expect_shift" = 1 ]; then
+		[ "${#CC_SHIFTS[@]}" -eq 1 ] || { fail "expected the retained current tuple, found ${#CC_SHIFTS[@]}"; return 1; }
+		if [ -f "$WORK/seed-copy.pcrlock" ] && [ "${#CC_SHIFTS[@]}" -eq 1 ]; then
+			cmp -s "$WORK/seed-copy.pcrlock" "${CC_SHIFTS[0]}" || {
+				fail "the retained current tuple was overwritten"
+				return 1
+			}
+		fi
+	else
+		[ "${#CC_SHIFTS[@]}" -eq 0 ] || { fail "unexpected shifted tuple"; return 1; }
+	fi
+
+	if [ "${#expected_covered[@]}" -gt 0 ]; then
+		if [ "${#expected_covered[@]}" != "${#CC_GEN[@]}" ]; then
+			fail "generated ${#CC_GEN[@]} tuples, expected ${#expected_covered[@]}"
+			return 1
+		fi
+		for CC_ENTRY in ${expected_covered[@]+"${expected_covered[@]}"}; do
+			read -r CC_NAME CC_CMD CC_INIT <<<"$CC_ENTRY"
+			CC_HIT=
+			for CC_F in ${CC_GEN[@]+"${CC_GEN[@]}"}; do
+				[ "$(pairs_of "$CC_F")" = "$CC_CMD $CC_INIT" ] && CC_HIT=1 && break
+			done
+			if [ -z "$CC_HIT" ]; then
+				fail "entry $CC_NAME is not covered by any generated tuple"
+				return 1
+			fi
+		done
+	fi
+	if [ "${#expected_absent[@]}" -gt 0 ]; then
+		for CC_ENTRY in ${expected_absent[@]+"${expected_absent[@]}"}; do
+			read -r CC_NAME CC_CMD <<<"$CC_ENTRY"
+			for CC_F in ${CC_GEN[@]+"${CC_GEN[@]}"}; do
+				case "$(pairs_of "$CC_F")" in
+					*"$CC_CMD"*)
+						fail "entry $CC_NAME was generated, and should not have been"
+						return 1 ;;
+				esac
+			done
+		done
+	fi
+
+	case "$expect_msg" in
+		loop) grep -q "More than 4 variations for 710-kernel-cmdline-initrd-entry$" "$WORK/stderr.log" || {
+			fail "expected the loop budget message"
+			return 1
+		} ;;
+		initial) grep -q "More than 4 variations for 710-kernel-cmdline-initrd-entry (initial)" "$WORK/stderr.log" || {
+			fail "expected the installer budget message"
+			return 1
+		} ;;
+		none) if grep -q "More than 4 variations for 710-kernel-cmdline-initrd-entry" "$WORK/stderr.log"; then
+			fail "unexpected budget message"
+			return 1
+		fi ;;
+	esac
+}
+
+wanted()
+{
+	[ "${#only[@]}" -eq 0 ] && return 0
+	for w in ${only[@]+"${only[@]}"}; do
+		[ "$w" = "$1" ] && return 0
+	done
+	return 1
+}
+
+write_entries_abcd()
+{
+	cat > "$WORK/entries.json" <<-'EOF'
+		[
+		 {"priority": 0, "kernel": [6, 13, 2, 1], "linux": "/boot/vmlinuz-A", "initrd": ["/boot/initrd-A"], "options": "root=UUID=aaaa-0001 rootflags=subvol=/@ quiet"},
+		 {"priority": 1, "kernel": [6, 12, 9, 1], "linux": "/boot/vmlinuz-B", "initrd": ["/boot/initrd-B"], "options": "root=UUID=aaaa-0002 rootflags=subvol=/@ quiet"},
+		 {"priority": 2, "kernel": [6, 11, 4, 1], "linux": "/boot/vmlinuz-C", "initrd": ["/boot/initrd-C"], "options": "root=UUID=aaaa-0003 rootflags=subvol=/@ quiet"},
+		 {"priority": 3, "kernel": [6, 10, 7, 1], "linux": "/boot/vmlinuz-D", "initrd": ["/boot/initrd-D"], "options": "root=UUID=aaaa-0004 rootflags=subvol=/@ quiet"}
+		]
+	EOF
+	for x in A B C D; do
+		write_boot_file "/boot/vmlinuz-$x" "linux-$x"
+		write_boot_file "/boot/initrd-$x" "initrd-$x"
+	done
+}
+
+# One observable behavior per case.
+
+c_shift_keeps_budget()
+{
+	setup_case shift-keeps-budget
+	write_entries_abcd
+	seed_current 0
+	# The retained current plus the three highest-priority futures;
+	# D is past the budget
+	# shellcheck disable=SC2086
+	C_PAIR="$(future_tuple 0)"; note_expected A $C_PAIR
+	# shellcheck disable=SC2086
+	C_PAIR="$(future_tuple 1)"; note_expected B $C_PAIR
+	# shellcheck disable=SC2086
+	C_PAIR="$(future_tuple 2)"; note_expected C $C_PAIR
+	# shellcheck disable=SC2086
+	C_ABSENT="$(future_tuple 3)"; note_absent D $C_ABSENT
+	expect_msg=loop
+	run_harness ""
+	check_component
+}
+
+c_no_shift_stable()
+{
+	setup_case no-shift-stable
+	write_entries_abcd
+	for C_I in 0 1 2 3; do
+		# shellcheck disable=SC2086
+		C_PAIR="$(future_tuple "$C_I")"
+		# shellcheck disable=SC2086
+		note_expected "$(printf '%c' "$((65 + C_I))")" $C_PAIR
+	done
+	expect_msg=none
+	run_harness ""
+	check_component
+}
+
+write_initial_i1_i2()
+{
+	cat > "$WORK/initial.json" <<-'EOF'
+		[
+		 {"priority": 0, "kernel": [6, 9, 1, 1], "linux": "/boot/vmlinuz-I1", "initrd": ["/boot/init-I1"], "options": "root=UUID=iiii-0001 rootflags=subvol=/@ splash"},
+		 {"priority": 1, "kernel": [6, 8, 3, 1], "linux": "/boot/vmlinuz-I2", "initrd": ["/boot/init-I2"], "options": "root=UUID=iiii-0002 rootflags=subvol=/@ splash"}
+		]
+	EOF
+	mkdir -p "$WORK/run/boot"
+	echo -n "initial-initrd-1" > "$WORK/run/boot/init-I1"
+	echo -n "initial-initrd-2" > "$WORK/run/boot/init-I2"
+	mkdir -p "$WORK/seed/boot"
+	echo -n "initial-initrd-1" > "$WORK/seed/boot/init-I1"
+	echo -n "initial-initrd-2" > "$WORK/seed/boot/init-I2"
+}
+
+c_installer_shared_budget()
+{
+	setup_case installer-shared-budget
+	cat > "$WORK/entries.json" <<-'EOF'
+		[
+		 {"priority": 0, "kernel": [6, 13, 2, 1], "linux": "/boot/vmlinuz-A", "initrd": ["/boot/initrd-A"], "options": "root=UUID=aaaa-0001 rootflags=subvol=/@ quiet"},
+		 {"priority": 1, "kernel": [6, 12, 9, 1], "linux": "/boot/vmlinuz-B", "initrd": ["/boot/initrd-B"], "options": "root=UUID=aaaa-0002 rootflags=subvol=/@ quiet"}
+		]
+	EOF
+	for x in A B; do
+		write_boot_file "/boot/vmlinuz-$x" "linux-$x"
+		write_boot_file "/boot/initrd-$x" "initrd-$x"
+	done
+	write_initial_i1_i2
+	seed_current 0
+	# shellcheck disable=SC2086
+	C_PAIR="$(future_tuple 0)"; note_expected A $C_PAIR
+	# shellcheck disable=SC2086
+	C_PAIR="$(future_tuple 1)"; note_expected B $C_PAIR
+	# shellcheck disable=SC2086
+	C_PAIR="$(initial_tuple 0)"; note_expected I1 $C_PAIR
+	# shellcheck disable=SC2086
+	C_ABSENT="$(initial_tuple 1)"; note_absent I2 $C_ABSENT
+	expect_msg=initial
+	run_harness "1"
+	check_component
+}
+
+c_fewer_inputs()
+{
+	setup_case fewer-inputs
+	cat > "$WORK/entries.json" <<-'EOF'
+		[
+		 {"priority": 0, "kernel": [6, 13, 2, 1], "linux": "/boot/vmlinuz-A", "initrd": ["/boot/initrd-A"], "options": "root=UUID=aaaa-0001 rootflags=subvol=/@ quiet"},
+		 {"priority": 1, "kernel": [6, 12, 9, 1], "linux": "/boot/vmlinuz-B", "initrd": ["/boot/initrd-B"], "options": "root=UUID=aaaa-0002 rootflags=subvol=/@ quiet"}
+		]
+	EOF
+	for x in A B; do
+		write_boot_file "/boot/vmlinuz-$x" "linux-$x"
+		write_boot_file "/boot/initrd-$x" "initrd-$x"
+	done
+	seed_current 0
+	# shellcheck disable=SC2086
+	C_PAIR="$(future_tuple 0)"; note_expected A $C_PAIR
+	# shellcheck disable=SC2086
+	C_PAIR="$(future_tuple 1)"; note_expected B $C_PAIR
+	expect_msg=none
+	run_harness ""
+	check_component
+}
+
+c_at_limit_keeps_current()
+{
+	setup_case at-limit-keeps-current
+	cat > "$WORK/entries.json" <<-'EOF'
+		[
+		 {"priority": 0, "kernel": [6, 13, 2, 1], "linux": "/boot/vmlinuz-A", "initrd": ["/boot/initrd-A"], "options": "root=UUID=aaaa-0001 rootflags=subvol=/@ quiet"},
+		 {"priority": 1, "kernel": [6, 12, 9, 1], "linux": "/boot/vmlinuz-B", "initrd": ["/boot/initrd-B"], "options": "root=UUID=aaaa-0002 rootflags=subvol=/@ quiet"},
+		 {"priority": 2, "kernel": [6, 11, 4, 1], "linux": "/boot/vmlinuz-C", "initrd": ["/boot/initrd-C"], "options": "root=UUID=aaaa-0003 rootflags=subvol=/@ quiet"}
+		]
+	EOF
+	for x in A B C; do
+		write_boot_file "/boot/vmlinuz-$x" "linux-$x"
+		write_boot_file "/boot/initrd-$x" "initrd-$x"
+	done
+	cat > "$WORK/initial.json" <<-'EOF'
+		[
+		 {"priority": 0, "kernel": [6, 9, 1, 1], "linux": "/boot/vmlinuz-I1", "initrd": ["/boot/init-I1"], "options": "root=UUID=iiii-0001 rootflags=subvol=/@ splash"}
+		]
+	EOF
+	mkdir -p "$WORK/run/boot"
+	echo -n "initial-initrd-1" > "$WORK/run/boot/init-I1"
+	mkdir -p "$WORK/seed/boot"
+	echo -n "initial-initrd-1" > "$WORK/seed/boot/init-I1"
+	seed_current 0
+	# At the limit the current stays and the installer tuple yields:
+	# shift plus the three priority-sorted futures
+	# shellcheck disable=SC2086
+	C_PAIR="$(future_tuple 0)"; note_expected A $C_PAIR
+	# shellcheck disable=SC2086
+	C_PAIR="$(future_tuple 1)"; note_expected B $C_PAIR
+	# shellcheck disable=SC2086
+	C_PAIR="$(future_tuple 2)"; note_expected C $C_PAIR
+	# shellcheck disable=SC2086
+	C_ABSENT="$(initial_tuple 0)"; note_absent I1 $C_ABSENT
+	expect_msg=initial
+	run_harness "1"
+	check_component
+}
+
+expect_shift=0
+expect_msg=none
+
+# One observable behavior per invocation: the runner isolates the case
+# in a subshell, so a failure stops that case without ending the run
+run_case()
+{
+	total_cases=$((total_cases + 1))
+	if (
+	expect_shift=0
+	expect_msg=none
+	expected_covered=()
+	expected_absent=()
+	set +e
+	"$1"
+	); then
+		echo "ok   $2"
+		return 0
+	fi
+	failed_cases=$((failed_cases + 1))
+	echo "FAIL $2"
+}
+
+wanted shift-keeps-budget && run_case c_shift_keeps_budget "shift present with 4 futures keeps current plus 3"
+wanted no-shift-stable && run_case c_no_shift_stable "no shift with 4 futures generates all 4"
+wanted installer-shared-budget && run_case c_installer_shared_budget "installer tuple shares the budget with the shift"
+wanted fewer-inputs && run_case c_fewer_inputs "shift with 2 futures generates both, no message"
+wanted at-limit-keeps-current && run_case c_at_limit_keeps_current "at the limit the current is kept, not overwritten"
+
+echo
+if [ "$failed_cases" = 0 ]; then
+	echo "$total_cases cases, all passed"
+else
+	echo "$total_cases cases, $failed_cases failed"
+	exit 1
+fi

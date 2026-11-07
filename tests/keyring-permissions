@@ -1,0 +1,60 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright 2026 SUSE LLC
+# Exercises the real key helper with a uniquely named, non-secret key.
+# Usage: sudo bash tests/keyring-permissions [--script PATH]
+set -euo pipefail
+
+script="$(dirname "$(realpath "$0")")/../sdbootutil"
+if [ "${1:-}" = --script ]; then
+	script=${2:?--script needs a path}
+	shift 2
+fi
+[ "$#" -eq 0 ] || { echo 'Unexpected arguments' >&2; exit 2; }
+[ "$(id -u)" -eq 0 ] || { echo 'SKIP: needs root for the sudo keyring case'; exit 77; }
+command -v keyctl >/dev/null || { echo 'SKIP: keyctl unavailable'; exit 77; }
+
+name=sdbootutil-key-permission-test-$$
+info() { :; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+keyctl_timeout=30
+created_keys=()
+
+cleanup()
+{
+	local id
+	# A failed creation may leave a key with view-only owner permission.
+	id=$(keyctl list @u | awk -v name="$name" '$NF==name {sub(/:$/,"",$1); print $1; exit}')
+	[ -n "$id" ] || return 0
+	keyctl unlink "$id" @s 2>/dev/null || true
+	keyctl unlink "$id" @u
+}
+trap cleanup EXIT
+
+definition=$(sed -n '/^keyctl_add_with_timeout()/,/^}/p' "$script")
+[ -n "$definition" ] || { echo 'Missing key helper' >&2; exit 2; }
+eval "$definition"
+
+user_ring=$(keyctl id @u)
+root_link_before=$(keyctl list @s | awk -v id="$user_ring:" '$1==id {print $1}')
+output=$(keyctl_add_with_timeout "$name" public-test-fixture)
+[ -z "$output" ] || { echo 'FAIL: helper polluted password stdout' >&2; exit 1; }
+id=$(keyctl search @u user "$name")
+metadata=$(keyctl rdescribe "$id")
+case "$metadata" in
+	user\;0\;0\;003f0000\;*) ;;
+	*) echo 'FAIL: key is not restricted to its owner' >&2; exit 1 ;;
+esac
+keyctl list @s | awk -v id="$id:" '$1==id {found=1} END {exit !found}'
+hex_id=$(printf '%08x' "$id")
+expiry=$(awk -v id="$hex_id" '$1==id {print $4}' /proc/keys)
+[[ "$expiry" =~ ^[0-9]+s$ ]] && [ "${expiry%s}" -le "$keyctl_timeout" ] || {
+	echo 'FAIL: temporary key has no bounded expiry' >&2
+	exit 1
+}
+root_link_after=$(keyctl list @s | awk -v id="$user_ring:" '$1==id {print $1}')
+[ "$root_link_before" = "$root_link_after" ] || {
+	echo 'FAIL: helper exposed the root user keyring to its caller' >&2
+	exit 1
+}
+printf 'PASS: private-session setup, owner-only key, expiry setup, session link, clean stdout\n'
