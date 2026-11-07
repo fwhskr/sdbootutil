@@ -716,12 +716,11 @@ keyctl_add_with_timeout()
 	# login session, so the key is not accessible to the owner
 	# See https://mjg59.dreamwidth.org/37333.html
 	keyid="$(echo -n "$value" | keyctl padd user "$key" @u)"
-	# Remove permission from the possesor.  For some reason that I
-	# do not understand, this can fail in YaST when called via
-	# cheetah
+	# sudo may not possess @u. Acquire it only in a private session
+	# before restricting the key to its owner, never in the caller's session.
 	# Returning here would leave the secret in the keyring with no
 	# expiry at all, which is worse than the wrong permissions
-	keyctl setperm "$keyid" 0x003f0000 2> /dev/null || \
+	keyctl session - /bin/sh -c 'keyctl link @u @s && keyctl setperm "$1" 0x003f0000' sh "$keyid" || \
 		warn "Failed to change the permissions of $key"
 	# The countdown starts here only as a backstop for a run that is
 	# killed before `cleanup` can restart it.  Every consumer is
@@ -4164,7 +4163,9 @@ pcrlock_sdboot()
 	# Join the cmdline and the initrd in a single component
 	shift_component 710-kernel-cmdline-initrd-entry
 	shift_component 710-kernel-cmdline-boot-loader
-	n=0
+	# Retained current-boot variations share the four-tuple PCR 9 budget.
+	local -a shifted_variations=(/var/lib/pcrlock.d/710-kernel-cmdline-initrd-entry.pcrlock.d/shift-*.pcrlock)
+	n=${#shifted_variations[@]}
 	while read -r cmdline; do
 		read -r initrd
 		[ -f "${boot_root}$initrd" ] || {
@@ -4824,26 +4825,19 @@ explain_pcrlock_policy_error()
 	local errorfile="$1"
 	local pin="$2"
 
-	# A recovery PIN was used, so the PCRs were not part of the
-	# authorization and this is a different problem: the PIN is what has
-	# to satisfy the PolicySigned of the NVIndex, and the TPM2 refusing
-	# the write is what a wrong one looks like.  Saying anything about
-	# PCRs here would only send the reader the wrong way
+	# A supplied PIN bypasses PCR-based unsealing, but an NV write failure
+	# alone does not distinguish an incorrect PIN from an enrollment problem.
 	if [ -n "$pin" ]; then
 		grep -q "Failed to write to NV index" "$errorfile" || return 0
 
-		warn "The TPM2 rejected the recovery PIN, so the NVIndex keeps the policy it had"
+		warn "TPM2 recovery authorization failed; the NVIndex policy was not changed"
 
-		# The recovery key and the recovery PIN are meant to be the
-		# same secret, and a key enrolled while the PIN was out of
-		# reach used to be published under the name of the PIN.  A
-		# "PIN" that opens the devices is that confusion, and it
-		# cannot become the PIN: `systemd-pcrlock` authorizes the
-		# NVIndex with the PIN that sealed it, and only with it
+		# Disk unlocking is a separate check, not a diagnosis of the
+		# TPM2 authorization failure.
 		local dev
 		for dev in "${tracked_devices[@]}"; do
 			valid_password "$dev" "$pin" || continue
-			warn "That value opens $dev, so it is the recovery key and not the recovery PIN of the NVIndex"
+			warn "That value opens $dev; this does not establish why TPM2 policy authorization failed"
 			break
 		done
 
